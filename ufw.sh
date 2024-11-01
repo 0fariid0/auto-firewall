@@ -11,6 +11,8 @@ for port in $ports; do
     sudo ufw allow "$port"/tcp
 done
 
+sudo ufw deny out from any to 25.0.0.0/8
+sudo ufw deny out from any to 25.208.254.0/32
 sudo ufw deny out from any to 200.0.0.0/8
 sudo ufw deny out from any to 102.0.0.0/8
 sudo ufw deny out from any to 10.0.0.0/8
@@ -21,7 +23,7 @@ sudo ufw deny out from any to 198.51.100.0/24
 sudo ufw deny out from any to 203.0.113.0/24
 sudo ufw deny out from any to 224.0.0.0/4
 sudo ufw deny out from any to 240.0.0.0/4
-sudo ufw deny out from any to 255.255.255.255/32
+sudo ufw deny out from any to 255.255.255.0/32
 sudo ufw deny out from any to 192.0.0.0/24
 sudo ufw deny out from any to 192.0.2.0/24
 sudo ufw deny out from any to 127.0.0.0/8

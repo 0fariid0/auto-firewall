@@ -12,6 +12,23 @@ for port in $ports; do
 done
 
 
+
+sudo ufw deny out from any to 23.235.40.0/24
+sudo ufw deny out from any to 43.249.75.0/24
+sudo ufw deny out from any to 94.46.144.0/24
+sudo ufw deny out from any to 103.66.28.0/24
+sudo ufw deny out from any to 103.66.30.0/24
+sudo ufw deny out from any to 103.228.104.0/24
+sudo ufw deny out from any to 103.244.50.0/24
+sudo ufw deny out from any to 103.245.223.0/24
+sudo ufw deny out from any to 151.139.2.0/24
+sudo ufw deny out from any to 151.139.4.0/24
+sudo ufw deny out from any to 151.139.7.0/24
+sudo ufw deny out from any to 151.139.104.0/24
+sudo ufw deny out from any to 151.139.0.0/16
+sudo ufw deny out from any to 157.52.82.125
+sudo ufw deny out from any to 192.16.2.7
+sudo ufw deny out from any to 217.22.29.98
 sudo ufw deny out from any to 25.20.151.169
 sudo ufw deny out from any to 192.0.0.0/24
 sudo ufw deny out from any to 25.0.0.0/8

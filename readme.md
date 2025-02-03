@@ -18,7 +18,7 @@
 
 ### مراحل نصب و اجرا
 
-1. ابتدا مخزن `auto-firewall` را از GitHub خود دانلود کنید و اسکریپت را اجرا کنید:
+1.  اسکریپت را اجرا کنید:
 
    ```bash
    bash -c "$(curl -fsSL https://raw.githubusercontent.com/0fariid0/auto-firewall/main/download_and_run.sh)"

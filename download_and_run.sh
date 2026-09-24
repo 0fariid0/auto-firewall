@@ -51,19 +51,6 @@ fi
 rm -f /root/ping_files/ping_iran.sh /root/ping_files/ping_kharej.sh
 rmdir /root/ping_files 2>/dev/null || true
 
-# Delete only rules created by this script on an earlier run. Rules belonging
-# to Xray, Docker, GRE, WireGuard and other applications are left untouched.
-mapfile -t managed_rule_numbers < <(
-    ufw status numbered 2>/dev/null |
-    awk '/auto-firewall/ {line=$0; sub(/^\[[[:space:]]*/, "", line); split(line, fields, "]"); print fields[1]}' |
-    sort -rn
-)
-
-for rule_number in "${managed_rule_numbers[@]}"; do
-    [[ $rule_number =~ ^[0-9]+$ ]] || continue
-    ufw --force delete "$rule_number" >/dev/null
-done
-
 declare -A tcp_ports=()
 declare -A udp_ports=()
 declare -A ssh_ports=()
@@ -155,6 +142,26 @@ if [[ -n ${AUTO_FIREWALL_UDP_PORTS:-} ]]; then
     done
 fi
 
+# Prevent an accidental attempt to create thousands of individual UFW rules.
+detected_port_count=$((${#tcp_ports[@]} + ${#udp_ports[@]}))
+max_auto_ports=${AUTO_FIREWALL_MAX_AUTO_PORTS:-128}
+if ! [[ $max_auto_ports =~ ^[0-9]+$ ]] || (( max_auto_ports < 1 )); then
+    echo "Error: AUTO_FIREWALL_MAX_AUTO_PORTS must be a positive number." >&2
+    exit 1
+fi
+if (( detected_port_count > max_auto_ports )); then
+    echo "Error: $detected_port_count public listening ports were detected." >&2
+    echo "The firewall was not changed. Close unused listeners or explicitly raise AUTO_FIREWALL_MAX_AUTO_PORTS." >&2
+    exit 1
+fi
+
+# Rebuilding UFW once is dramatically faster and safer than deleting hundreds
+# of old numbered rules one by one. The complete previous state was backed up
+# above. This reset affects UFW rules only; Docker/Xray/tunnel iptables chains
+# are not flushed.
+echo "Resetting old UFW rules once..."
+ufw --force reset >/dev/null
+
 # Use conservative defaults. Routed traffic is denied unless it belongs to a
 # declared tunnel range below.
 ufw default deny incoming
@@ -213,40 +220,6 @@ blocked_destinations=(
 
 for destination in "${blocked_destinations[@]}"; do
     ufw deny out to "$destination" comment 'auto-firewall special-use'
-done
-
-# Remove exact direct FORWARD drops created by legacy versions. Do not flush
-# iptables: Docker, Xray and tunnel managers may own unrelated rules.
-legacy_direct_source_blocks=(
-    200.0.0.0/8
-    102.0.0.0/8
-    10.0.0.0/8
-    100.64.0.0/10
-    169.254.0.0/16
-    198.18.0.0/15
-    198.51.100.0/24
-    203.0.113.0/24
-    224.0.0.0/4
-    240.0.0.0/4
-    255.255.255.255/32
-    192.0.0.0/24
-    192.0.2.0/24
-    127.0.0.0/8
-    127.0.53.53/32
-    192.168.0.0/16
-    0.0.0.0/8
-    172.16.0.0/12
-    224.0.0.0/3
-    192.88.99.0/24
-    198.18.140.0/24
-    102.230.9.0/24
-    102.233.71.0/24
-)
-
-for source in "${legacy_direct_source_blocks[@]}"; do
-    while iptables -C FORWARD -s "$source" -j DROP >/dev/null 2>&1; do
-        iptables -D FORWARD -s "$source" -j DROP
-    done
 done
 
 ufw --force enable

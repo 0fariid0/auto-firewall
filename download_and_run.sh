@@ -2,99 +2,98 @@
     
   
 #!/usr/bin/env bash
-# Auto Firewall: preserve SSH, discover live ports, and keep GRE/WireGuard usable.
+
 set -Eeuo pipefail
 
-(( EUID == 0 )) || { echo 'Run as root.' >&2; exit 1; }
-for tool in ufw ss awk sort flock; do
-    command -v "$tool" >/dev/null 2>&1 || { echo "Missing: $tool" >&2; exit 1; }
+if (( EUID != 0 )); then
+    echo "Error: this script must be run as root." >&2
+    exit 1
+fi
+
+for command_name in ufw ss iptables awk sort flock; do
+    if ! command -v "$command_name" >/dev/null 2>&1; then
+        echo "Error: required command '$command_name' was not found." >&2
+        exit 1
+    fi
 done
 
-# No concurrent copies of this script may modify UFW.
+# Prevent overlapping runs from editing UFW at the same time.
 exec 9>/run/gretun-ufw.lock
-flock -w 60 9 || { echo 'UFW is busy; retry later.' >&2; exit 1; }
+flock -w 60 9 || { echo "Error: another firewall update is running." >&2; exit 1; }
 
-# Remove the obsolete ping service from the earlier release.
+# Remove the ping service and files created by older releases.
 if command -v systemctl >/dev/null 2>&1; then
     systemctl disable --now ping_service.service >/dev/null 2>&1 || true
 fi
+
 if [[ -f /etc/systemd/system/ping_service.service ]]; then
     rm -f /etc/systemd/system/ping_service.service
-    systemctl daemon-reload >/dev/null 2>&1 || true
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl daemon-reload
+    fi
 fi
+
 rm -f /root/ping_files/ping_iran.sh /root/ping_files/ping_kharej.sh
 rmdir /root/ping_files 2>/dev/null || true
 
-# A damaged UFW tuple must be repaired before changing the stored rules.
-ufw_errors=$(mktemp)
-trap 'rm -f "$ufw_errors"' EXIT
-if ! saved_rules=$(ufw show added 2>"$ufw_errors"); then
-    cat "$ufw_errors" >&2
-    echo 'Cannot inspect UFW rules; no firewall changes were made.' >&2
-    exit 1
-fi
-if [[ -s $ufw_errors ]]; then
-    cat "$ufw_errors" >&2
-    echo 'UFW reported a malformed saved rule; no firewall changes were made.' >&2
-    exit 1
-fi
-
-declare -A known_rules=() tcp_ports=() udp_ports=()
-first_rule=''
-while IFS= read -r line; do
-    [[ $line == ufw\ * ]] || continue
-    [[ -n $first_rule ]] || first_rule=$line
-    known_rules["${line%% comment *}"]=1
-done <<< "$saved_rules"
-changed=0
-rule_exists() { [[ -v known_rules["ufw $*"] ]]; }
+# Read once so repeated runs do not send already saved rules back to UFW.
+saved_rules="$(ufw show added)" || exit 1
+rule_exists() {
+    local expected="ufw $*" line
+    while IFS= read -r line; do
+        [[ $line == "$expected" || $line == "$expected comment "* ]] && return 0
+    done <<< "$saved_rules"
+    return 1
+}
 ensure_rule() {
-    rule_exists "$@" && return 0
+    local arg
+    local -a without_comment=()
+    for arg in "$@"; do
+        [[ $arg == comment ]] && break
+        without_comment+=("$arg")
+    done
+    rule_exists "${without_comment[@]}" && return 0
     ufw "$@" >/dev/null
-    known_rules["ufw $*"]=1
-    ((changed+=1))
+    saved_rules+=$'\n'"ufw ${without_comment[*]}"
 }
 
-# A late SSH allow can sit behind an earlier DENY. Guarantee TCP/22 is first.
+# TCP/22 must precede any older DENY. Preserve the same SSH allow on reruns.
+first_rule="$(awk '/^ufw / {print; exit}' <<< "$saved_rules")"
 if [[ $first_rule != 'ufw allow 22/tcp' && $first_rule != 'ufw allow 22/tcp comment '* ]]; then
-    if rule_exists allow 22/tcp; then
-        ufw delete allow 22/tcp >/dev/null
-        unset 'known_rules[ufw allow 22/tcp]'
-    fi
+    if rule_exists allow 22/tcp; then ufw delete allow 22/tcp >/dev/null; fi
     ufw insert 1 allow 22/tcp >/dev/null
-    first_rule=$(ufw show added | awk '/^ufw / {print; exit}')
-    [[ $first_rule == 'ufw allow 22/tcp' || $first_rule == 'ufw allow 22/tcp comment '* ]] || {
-        echo 'TCP/22 was not placed first; refusing to enable UFW.' >&2; exit 1;
-    }
-    known_rules['ufw allow 22/tcp']=1
-    ((changed+=1))
+    saved_rules=$'ufw allow 22/tcp\n'"$saved_rules"
 fi
 
-add_port() {
-    local proto=$1 port=$2
+declare -A tcp_ports=()
+declare -A ssh_ports=()
+
+add_tcp_port() {
+    local port=$1
+
     [[ $port =~ ^[0-9]+$ ]] || return 0
     (( port >= 1 && port <= 65535 )) || return 0
     [[ $port == 222 ]] && return 0
-    if [[ $proto == tcp && $port != 22 ]]; then tcp_ports["$port"]=1; fi
-    if [[ $proto == udp ]]; then udp_ports["$port"]=1; fi
+
+    tcp_ports["$port"]=1
 }
 
-while IFS= read -r port; do add_port tcp "$port"; done < <(ss -H -lnt | awk '{a=$4; sub(/^.*:/,"",a); print a}')
-while IFS= read -r port; do add_port udp "$port"; done < <(ss -H -lnu | awk '{a=$4; sub(/^.*:/,"",a); print a}')
-if [[ -n ${AUTO_FIREWALL_TCP_PORTS:-} ]]; then
-    for port in ${AUTO_FIREWALL_TCP_PORTS//,/ }; do add_port tcp "$port"; done
-fi
-if [[ -n ${AUTO_FIREWALL_UDP_PORTS:-} ]]; then
-    for port in ${AUTO_FIREWALL_UDP_PORTS//,/ }; do add_port udp "$port"; done
-fi
+add_ssh_port() {
+    local port=$1
 
-# UFW accepts comma-separated ports (at most 15 per rule). This replaces
-# one Python process per listener with one process per group of listeners.
-allow_port_groups() {
-    local proto=$1 group='' count=0 port
-    shift
-    for port in "$@"; do
-        if (( count == 15 )); then
-            ensure_rule allow proto "$proto" from any to any port "$group"
-            group='' count=0
+    [[ $port =~ ^[0-9]+$ ]] || return 0
+    (( port >= 1 && port <= 65535 )) || return 0
+    [[ $port == 222 ]] && return 0
+
+    ssh_ports["$port"]=1
+    add_tcp_port "$port"
+}
+
+listening_tcp_ports() {
+    ss -H -lnt | awk '{address=$4; sub(/^.*:/, "", address); if (address ~ /^[0-9]+$/) print address}'
+}
+
+while IFS= read -r port; do
+    add_tcp_port "$port"
+done < <(listening_tcp_ports)
 

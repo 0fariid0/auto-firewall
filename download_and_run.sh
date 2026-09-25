@@ -7,7 +7,7 @@ if (( EUID != 0 )); then
     exit 1
 fi
 
-for command_name in ufw ss iptables awk sort; do
+for command_name in ufw ss iptables awk sort flock; do
     if ! command -v "$command_name" >/dev/null 2>&1; then
         echo "Error: required command '$command_name' was not found." >&2
         exit 1
@@ -15,10 +15,8 @@ for command_name in ufw ss iptables awk sort; do
 done
 
 # Only one invocation may edit UFW at a time. GRE-TUN uses the same lock.
-if command -v flock >/dev/null 2>&1; then
-    exec 9>/run/gretun-ufw.lock
-    flock -w 60 9 || { echo 'UFW is busy; retry later.' >&2; exit 1; }
-fi
+exec 9>/run/gretun-ufw.lock
+flock -w 60 9 || { echo 'UFW is busy; retry later.' >&2; exit 1; }
 
 # Remove the ping service and files created by older releases.
 if command -v systemctl >/dev/null 2>&1; then
@@ -35,9 +33,45 @@ fi
 rm -f /root/ping_files/ping_iran.sh /root/ping_files/ping_kharej.sh
 rmdir /root/ping_files 2>/dev/null || true
 
-# This exact rule fixed SSH access in the previous release. Apply it first,
-# before port discovery, deny rules, or enabling UFW.
-ufw allow 22/tcp
+# Inspect saved rules once. Repeated UFW calls become very slow on hosts that
+# already have many rules, even when UFW reports "Skipping adding existing".
+saved_rules="$(ufw show added)" || { echo 'Cannot inspect saved UFW rules; leaving firewall untouched.' >&2; exit 1; }
+changed_rules=0
+declare -A rules_cache=()
+first_saved_rule=''
+while IFS= read -r line; do
+    [[ $line == ufw\ * ]] || continue
+    [[ -n $first_saved_rule ]] || first_saved_rule=$line
+    rules_cache["${line%% comment *}"]=1
+done <<< "$saved_rules"
+
+rule_exists() {
+    [[ -v rules_cache["ufw $*"] ]]
+}
+
+ensure_rule() {
+    rule_exists "$@" && return 0
+    ufw "$@" >/dev/null || return 1
+    rules_cache["ufw $*"]=1
+    ((changed_rules+=1))
+}
+
+# A plain allow appended after an old DENY rule may not protect SSH. Make a
+# wide TCP/22 allow the first IPv4 user rule, including when UFW is inactive.
+if [[ $first_saved_rule != 'ufw allow 22/tcp' && $first_saved_rule != 'ufw allow 22/tcp comment '* ]]; then
+    # UFW can skip an insert of a rule already present later in the list.
+    if rule_exists allow 22/tcp; then
+        ufw delete allow 22/tcp >/dev/null || exit 1
+        unset 'rules_cache[ufw allow 22/tcp]'
+    fi
+    ufw insert 1 allow 22/tcp >/dev/null || { echo 'Could not place SSH rule first; UFW was not enabled.' >&2; exit 1; }
+    first_saved_rule="$(ufw show added | awk '/^ufw / {print; exit}')"
+    [[ $first_saved_rule == 'ufw allow 22/tcp' || $first_saved_rule == 'ufw allow 22/tcp comment '* ]] || {
+        echo 'SSH rule is not first; refusing to enable UFW.' >&2; exit 1;
+    }
+    rules_cache['ufw allow 22/tcp']=1
+    ((changed_rules+=1))
+fi
 
 declare -A tcp_ports=()
 declare -A ssh_ports=()
@@ -105,14 +139,14 @@ fi
 echo "Opening TCP ports: $(printf '%s\n' "${!tcp_ports[@]}" | sort -n | paste -sd, -)"
 for port in $(printf '%s\n' "${!tcp_ports[@]}" | sort -n); do
     if [[ $port != 22 ]]; then
-        ufw allow "$port/tcp" comment 'auto-firewall'
+        ensure_rule allow "$port/tcp"
     fi
 done
 
 # UDP listeners (including public WireGuard endpoints) must survive UFW enable.
 while IFS= read -r port; do
     [[ $port =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 )) || continue
-    ufw allow "$port/udp" comment 'auto-firewall'
+    ensure_rule allow "$port/udp"
 done < <(listening_udp_ports | sort -nu)
 
 # GRE is IP protocol 47, not a TCP/UDP port. Read only the public endpoint
@@ -124,7 +158,7 @@ for config_dir in /etc/gre-tunnels /etc/greplus-tunnels; do
         local_ip=$(awk -F= '$1=="LOCAL_PUBLIC_IP" {gsub(/^[\047\"]|[\047\"]$/, "", $2); print $2; exit}' "$config")
         remote_ip=$(awk -F= '$1=="REMOTE_PUBLIC_IP" {gsub(/^[\047\"]|[\047\"]$/, "", $2); print $2; exit}' "$config")
         if [[ $local_ip =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ && $remote_ip =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            ufw allow proto gre from "$remote_ip" to "$local_ip" comment 'auto-firewall'
+            ensure_rule allow proto gre from "$remote_ip" to "$local_ip"
         fi
     done
 done
@@ -142,9 +176,9 @@ for config_dir in /etc/gre-tunnels /etc/greplus-tunnels /etc/wgtun-tunnels; do
             /etc/greplus-tunnels) ifc="greplus$id" ;;
             *) ifc="wgtun$id" ;;
         esac
-        ufw allow in on "$ifc" comment 'auto-firewall'
-        ufw route allow in on "$ifc" comment 'auto-firewall'
-        ufw route allow out on "$ifc" comment 'auto-firewall'
+        ensure_rule allow in on "$ifc"
+        ensure_rule route allow in on "$ifc"
+        ensure_rule route allow out on "$ifc"
     done
 done
 
@@ -197,19 +231,31 @@ forward_source_blocks=(
 # Older releases denied these private ranges, including GRE/GREPLUS's 10.x
 # inner addresses. Remove those exact stale rules before applying new rules.
 for subnet in 10.0.0.0/8 100.64.0.0/10 169.254.0.0/16 127.0.0.0/8 127.0.53.53 192.168.0.0/16 172.16.0.0/12; do
-    ufw delete deny out to "$subnet" >/dev/null 2>&1 || true
-    ufw route delete deny from "$subnet" >/dev/null 2>&1 || true
+    if rule_exists deny out to "$subnet"; then
+        ufw delete deny out to "$subnet" >/dev/null || exit 1
+        changed_rules=$((changed_rules + 1))
+        unset "rules_cache[ufw deny out to $subnet]"
+    fi
+    if rule_exists route deny from "$subnet"; then
+        ufw route delete deny from "$subnet" >/dev/null || exit 1
+        changed_rules=$((changed_rules + 1))
+        unset "rules_cache[ufw route deny from $subnet]"
+    fi
 done
-ufw delete allow 222/tcp >/dev/null 2>&1 || true
+if rule_exists allow 222/tcp; then
+    ufw delete allow 222/tcp >/dev/null || exit 1
+    changed_rules=$((changed_rules + 1))
+    unset 'rules_cache[ufw allow 222/tcp]'
+fi
 
 for destination in "${blocked_destinations[@]}"; do
-    ufw deny out to "$destination" comment 'auto-firewall'
+    ensure_rule deny out to "$destination"
 done
 
 # UFW route rules are persistent. The previous direct iptables rules were
 # duplicated on every run and 'iptables-save' did not actually save them.
 for source in "${forward_source_blocks[@]}"; do
-    ufw route deny from "$source" comment 'auto-firewall'
+    ensure_rule route deny from "$source"
 done
 
 # Remove exact legacy rules that older releases appended directly to FORWARD.
@@ -229,13 +275,18 @@ legacy_direct_source_blocks=(
 )
 
 for source in "${legacy_direct_source_blocks[@]}"; do
-    while iptables -C FORWARD -s "$source" -j DROP >/dev/null 2>&1; do
+    removed=0
+    while (( removed < 20 )) && iptables -C FORWARD -s "$source" -j DROP >/dev/null 2>&1; do
         iptables -D FORWARD -s "$source" -j DROP
+        ((removed+=1))
     done
 done
 
-ufw --force enable
+current_status="$(ufw status)" || exit 1
+if [[ $current_status == *'Status: inactive'* ]]; then
+    ufw --force enable >/dev/null
+fi
 
-echo
-echo "Firewall applied. SSH is allowed on TCP port(s): $(printf '%s\n' "${!ssh_ports[@]}" | sort -n | paste -sd, -)"
-ufw status verbose
+current_status="$(ufw status)" || exit 1
+[[ $current_status == *'Status: active'* ]] || { echo 'UFW did not become active.' >&2; exit 1; }
+echo "Firewall ready. New rules: $changed_rules. SSH TCP port(s): $(printf '%s\n' "${!ssh_ports[@]}" | sort -n | paste -sd, -)"
